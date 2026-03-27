@@ -340,9 +340,9 @@ __host__ __device__ inline bool better_candidate(
         candidate_x,
         candidate_y,
         candidate_z,
-        load_global(current_xs, current_index),
-        load_global(current_ys, current_index),
-        load_global(current_zs, current_index));
+        current_xs[current_index],
+        current_ys[current_index],
+        current_zs[current_index]);
     if (coordinate_cmp != 0) {
         return coordinate_cmp < 0;
     }
