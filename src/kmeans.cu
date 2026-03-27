@@ -456,8 +456,7 @@ template <int BlockSize>
 __global__ void remap_clusters_kernel(
     const IntensityType* __restrict__ intensities,
     const int* __restrict__ assignments,
-    const int* __restrict__ cluster_sizes,
-    const HistogramCountType* __restrict__ cluster_histograms,
+    const int* __restrict__ cluster_remaps,
     const int n,
     int* __restrict__ output_intensities) {
     const int point_index = blockIdx.x * BlockSize + threadIdx.x;
@@ -466,12 +465,75 @@ __global__ void remap_clusters_kernel(
     }
 
     const int cluster = assignments[point_index];
+    const int intensity = static_cast<int>(intensities[point_index]);
+    output_intensities[point_index] =
+        cluster_remaps[cluster * kIntensityLevels + intensity];
+}
+
+__host__ __device__ inline int remap_intensity_from_cluster_stats(
+    int center_intensity,
+    int neighborhood_size,
+    int cumulative_at_center,
+    int cumulative_min) {
+    if (neighborhood_size == cumulative_min) {
+        return center_intensity;
+    }
+    const int numerator = cumulative_at_center - cumulative_min;
+    if (numerator <= 0) {
+        return 0;
+    }
+    const int denominator = neighborhood_size - cumulative_min;
+    const std::int64_t scaled = static_cast<std::int64_t>(numerator) * 255;
+    int remapped = static_cast<int>(scaled / denominator);
+    if (remapped < 0) {
+        remapped = 0;
+    }
+    if (remapped > 255) {
+        remapped = 255;
+    }
+    return remapped;
+}
+
+__global__ void compute_cluster_remap_kernel(
+    const int k,
+    const int* __restrict__ cluster_sizes,
+    const HistogramCountType* __restrict__ cluster_histograms,
+    int* __restrict__ cluster_remaps) {
+    const int cluster = blockIdx.x;
+    if (cluster >= k) {
+        return;
+    }
+    const int neighborhood_size = cluster_sizes[cluster];
+    int* remaps = cluster_remaps + cluster * kIntensityLevels;
     const HistogramCountType* histogram =
         cluster_histograms + cluster * kIntensityLevels;
-    output_intensities[point_index] = remap_intensity(
-        histogram,
-        static_cast<int>(intensities[point_index]),
-        cluster_sizes[cluster]);
+    if (neighborhood_size <= 0) {
+        if (threadIdx.x == 0) {
+            for (int intensity = 0; intensity < kIntensityLevels; ++intensity) {
+                remaps[intensity] = 0;
+            }
+        }
+        return;
+    }
+    if (threadIdx.x == 0) {
+        int min_intensity = 0;
+        while (min_intensity < kIntensityLevels && histogram[min_intensity] == 0) {
+            ++min_intensity;
+        }
+        const int cumulative_min =
+            min_intensity < kIntensityLevels ? histogram[min_intensity] : 0;
+        int cumulative = 0;
+        for (int intensity = 0; intensity < kIntensityLevels; ++intensity) {
+            const int count = histogram[intensity];
+            const int cumulative_at_center = cumulative + count;
+            remaps[intensity] = remap_intensity_from_cluster_stats(
+                intensity,
+                neighborhood_size,
+                cumulative_at_center,
+                cumulative_min);
+            cumulative = cumulative_at_center;
+        }
+    }
 }
 
 InputData read_input(const std::string& path) {
@@ -712,6 +774,7 @@ std::vector<int> compute_kmeans_gpu(const InputData& data, const HostArrays& arr
     int* d_counts = nullptr;
     int* d_cluster_sizes = nullptr;
     HistogramCountType* d_cluster_histograms = nullptr;
+    int* d_cluster_remaps = nullptr;
     int* d_output_intensities = nullptr;
 
     const std::size_t point_bytes = static_cast<std::size_t>(data.n) * sizeof(int);
@@ -750,6 +813,7 @@ std::vector<int> compute_kmeans_gpu(const InputData& data, const HostArrays& arr
         CUDA_CHECK(cudaMalloc(&d_counts, centroid_bytes));
         CUDA_CHECK(cudaMalloc(&d_cluster_sizes, cluster_size_bytes));
         CUDA_CHECK(cudaMalloc(&d_cluster_histograms, cluster_histogram_bytes));
+        CUDA_CHECK(cudaMalloc(&d_cluster_remaps, static_cast<std::size_t>(data.k) * kIntensityLevels * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_output_intensities, output_bytes));
 
         CUDA_CHECK(cudaMemcpy(d_xs, arrays.xs.data(), point_bytes, cudaMemcpyHostToDevice));
@@ -838,11 +902,17 @@ std::vector<int> compute_kmeans_gpu(const InputData& data, const HostArrays& arr
             d_cluster_histograms);
         CUDA_CHECK(cudaGetLastError());
 
+        compute_cluster_remap_kernel<<<data.k, kThreadsPerBlock>>>(
+            data.k,
+            d_cluster_sizes,
+            d_cluster_histograms,
+            d_cluster_remaps);
+        CUDA_CHECK(cudaGetLastError());
+
         remap_clusters_kernel<kThreadsPerBlock><<<blocks, kThreadsPerBlock>>>(
             d_intensities,
             final_assignments,
-            d_cluster_sizes,
-            d_cluster_histograms,
+            d_cluster_remaps,
             data.n,
             d_output_intensities);
         CUDA_CHECK(cudaGetLastError());
@@ -871,6 +941,7 @@ std::vector<int> compute_kmeans_gpu(const InputData& data, const HostArrays& arr
         CUDA_CHECK(cudaFree(d_counts));
         CUDA_CHECK(cudaFree(d_cluster_sizes));
         CUDA_CHECK(cudaFree(d_cluster_histograms));
+        CUDA_CHECK(cudaFree(d_cluster_remaps));
         CUDA_CHECK(cudaFree(d_output_intensities));
 
         return output;
@@ -891,6 +962,7 @@ std::vector<int> compute_kmeans_gpu(const InputData& data, const HostArrays& arr
         cudaFree(d_counts);
         cudaFree(d_cluster_sizes);
         cudaFree(d_cluster_histograms);
+        cudaFree(d_cluster_remaps);
         cudaFree(d_output_intensities);
         throw;
     }

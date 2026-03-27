@@ -210,44 +210,45 @@ __host__ __device__ inline DistanceType squared_distance(
     return dx * dx + dy * dy + dz * dz;
 }
 
-template <typename HistogramType>
-__host__ __device__ inline int remap_intensity(
-    const HistogramType* histogram,
-    const int original_intensity,
-    const int neighborhood_size) {
-    int cumulative = 0;
-    int cumulative_min = 0;
-    bool found_non_zero_bin = false;
-    int cumulative_at_original = 0;
+__host__ __device__ inline int remap_intensity_from_neighbors(
+    const IntensityType center_intensity,
+    const IntensityType* neighbor_intensities,
+    const int neighbor_count) {
+    int min_intensity = static_cast<int>(center_intensity);
+    int count_min = 1;
+    int count_leq_center = 1;
 
-    for (int value = 0; value < kIntensityLevels; ++value) {
-        cumulative += static_cast<int>(histogram[value]);
-        if (!found_non_zero_bin && cumulative > 0) {
-            cumulative_min = cumulative;
-            found_non_zero_bin = true;
+    for (int neighbor = 0; neighbor < neighbor_count; ++neighbor) {
+        const int intensity = static_cast<int>(neighbor_intensities[neighbor]);
+        if (intensity < min_intensity) {
+            min_intensity = intensity;
+            count_min = 1;
+        } else if (intensity == min_intensity) {
+            ++count_min;
         }
-        if (value == original_intensity) {
-            cumulative_at_original = cumulative;
+        if (intensity <= static_cast<int>(center_intensity)) {
+            ++count_leq_center;
         }
     }
 
-    if (!found_non_zero_bin || neighborhood_size == cumulative_min) {
-        return original_intensity;
+    const int neighborhood_size = neighbor_count + 1;
+    if (neighborhood_size == count_min) {
+        return static_cast<int>(center_intensity);
     }
 
-    const int numerator = cumulative_at_original - cumulative_min;
+    const int numerator = count_leq_center - count_min;
     if (numerator <= 0) {
         return 0;
     }
 
-    const int denominator = neighborhood_size - cumulative_min;
+    const int denominator = neighborhood_size - count_min;
     const std::int64_t scaled = static_cast<std::int64_t>(numerator) * 255;
-    const int remapped = static_cast<int>(scaled / denominator);
+    int remapped = static_cast<int>(scaled / denominator);
     if (remapped < 0) {
-        return 0;
+        remapped = 0;
     }
     if (remapped > 255) {
-        return 255;
+        remapped = 255;
     }
     return remapped;
 }
@@ -415,15 +416,10 @@ std::vector<int> compute_exact_knn_cpu(const InputData& data, const HostArrays& 
                 best_intensities);
         }
 
-        HistogramCountType histogram[kIntensityLevels] = {};
-        ++histogram[arrays.intensities[point_index]];
-        for (int neighbor = 0; neighbor < data.k; ++neighbor) {
-            ++histogram[best_intensities[neighbor]];
-        }
-        output[point_index] = remap_intensity(
-            histogram,
-            static_cast<int>(arrays.intensities[point_index]),
-            data.k + 1);
+        output[point_index] = remap_intensity_from_neighbors(
+            arrays.intensities[point_index],
+            best_intensities,
+            data.k);
     }
 
     return output;
@@ -1058,16 +1054,10 @@ __global__ void exact_grid_knn_equalize_kernel(
         resolved = static_cast<double>(best_distances[k - 1]) <= lower_bound_sq;
     }
 
-    HistogramCountType histogram[kIntensityLevels];
-    for (int value = 0; value < kIntensityLevels; ++value) {
-        histogram[value] = 0;
-    }
-    ++histogram[center_intensity];
-    for (int neighbor = 0; neighbor < k; ++neighbor) {
-        ++histogram[best_intensities[neighbor]];
-    }
-    output_intensities[point_index] =
-        remap_intensity(histogram, static_cast<int>(center_intensity), k + 1);
+    output_intensities[point_index] = remap_intensity_from_neighbors(
+        center_intensity,
+        best_intensities,
+        k);
 }
 
 std::vector<int> compute_exact_knn_gpu(const InputData& data, const HostArrays& arrays) {
