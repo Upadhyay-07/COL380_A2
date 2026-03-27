@@ -2340,8 +2340,7 @@ std::vector<int> compute_kmeans_gpu(
 
     int* final_assignments = workspace.assignments_prev;
     for (int iteration = 0; iteration < data.t; ++iteration) {
-        // Reset changed_count and cluster-sum accumulators before the fused kernel.
-        CUDA_CHECK(cudaMemset(workspace.changed_count, 0, sizeof(int)));
+        // Reset cluster-sum accumulators before the fused kernel.
         CUDA_CHECK(cudaMemset(workspace.sum_xs, 0, centroid_bytes));
         CUDA_CHECK(cudaMemset(workspace.sum_ys, 0, centroid_bytes));
         CUDA_CHECK(cudaMemset(workspace.sum_zs, 0, centroid_bytes));
@@ -2367,14 +2366,6 @@ std::vector<int> compute_kmeans_gpu(
             workspace.sum_zs,
             workspace.counts);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        int changed_count = 0;
-        CUDA_CHECK(cudaMemcpy(&changed_count, workspace.changed_count, sizeof(int), cudaMemcpyDeviceToHost));
-        final_assignments = workspace.assignments_next;
-        if (changed_count == 0) {
-            break;
-        }
 
         // Recompute centroids from the accumulated sums.
         // No explicit sync needed here: update_centroids_kernel is enqueued in the

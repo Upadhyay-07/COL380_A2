@@ -28,6 +28,9 @@ constexpr double kVoxelDistancePercentile = 0.60;
 using IntensityType = std::uint8_t;
 using HistogramCountType = std::uint16_t;
 using FlagType = std::uint8_t;
+constexpr uint64_t kCellHashMulX = 0x9e3779b97f4a7c15ULL;
+constexpr uint64_t kCellHashMulY = 0xc2b2ae3d27d4eb4fULL;
+constexpr uint64_t kCellHashMulZ = 0x165667b19e3779f9ULL;
 
 struct Point {
     double x;
@@ -73,6 +76,8 @@ struct SpatialIndex {
     std::vector<double> sorted_zs;
     std::vector<IntensityType> sorted_intensities;
     std::vector<int> sorted_original_indices;
+    std::vector<int> cell_hash_values;
+    int cell_hash_mask = 0;
 };
 
 struct ApproxResult {
@@ -305,30 +310,31 @@ __device__ inline int find_cell_range(
     const long long* cell_xs,
     const long long* cell_ys,
     const long long* cell_zs,
+    const int* cell_hash_values,
+    const int cell_hash_mask,
     const int num_cells,
     const long long query_x,
     const long long query_y,
     const long long query_z) {
-    int low = 0;
-    int high = num_cells - 1;
-    while (low <= high) {
-        const int mid = low + (high - low) / 2;
-        const int cmp = compare_cell_triplets(
-            cell_xs[mid],
-            cell_ys[mid],
-            cell_zs[mid],
-            query_x,
-            query_y,
-            query_z);
-        if (cmp < 0) {
-            low = mid + 1;
-        } else if (cmp > 0) {
-            high = mid - 1;
-        } else {
-            return mid;
-        }
+    if (cell_hash_mask == 0 || cell_hash_values == nullptr) {
+        return -1;
     }
-    return -1;
+
+    uint64_t key = encode_cell_coords(query_x, query_y, query_z);
+    int slot = static_cast<int>(key & static_cast<uint64_t>(cell_hash_mask));
+    while (true) {
+        const int cell_id = cell_hash_values[slot];
+        if (cell_id < 0) {
+            return -1;
+        }
+        if (cell_id < num_cells &&
+            cell_xs[cell_id] == query_x &&
+            cell_ys[cell_id] == query_y &&
+            cell_zs[cell_id] == query_z) {
+            return cell_id;
+        }
+        slot = (slot + 1) & cell_hash_mask;
+    }
 }
 
 __host__ __device__ inline long long coordinate_to_cell(
@@ -366,6 +372,44 @@ __host__ __device__ inline double shell_outside_lower_bound_sq(
     return min_axis_distance * min_axis_distance;
 }
 
+__host__ __device__ inline uint64_t encode_cell_coords(
+    const long long x,
+    const long long y,
+    const long long z) {
+    const uint64_t ux = static_cast<uint64_t>(x);
+    const uint64_t uy = static_cast<uint64_t>(y);
+    const uint64_t uz = static_cast<uint64_t>(z);
+    return (ux * kCellHashMulX) ^ (uy * kCellHashMulY) ^ (uz * kCellHashMulZ);
+}
+
+void build_cell_hash_table(SpatialIndex& index) {
+    const int num_cells = static_cast<int>(index.cell_xs.size());
+    if (num_cells == 0) {
+        index.cell_hash_mask = 0;
+        index.cell_hash_values.clear();
+        return;
+    }
+
+    int table_size = 1;
+    while (table_size < num_cells * 2) {
+        table_size <<= 1;
+    }
+    index.cell_hash_mask = table_size - 1;
+    index.cell_hash_values.assign(table_size, -1);
+
+    for (int cell_id = 0; cell_id < num_cells; ++cell_id) {
+        const uint64_t key = encode_cell_coords(
+            index.cell_xs[cell_id],
+            index.cell_ys[cell_id],
+            index.cell_zs[cell_id]);
+        int slot = static_cast<int>(key & static_cast<uint64_t>(index.cell_hash_mask));
+        while (index.cell_hash_values[slot] != -1) {
+            slot = (slot + 1) & index.cell_hash_mask;
+        }
+        index.cell_hash_values[slot] = cell_id;
+    }
+}
+
 __device__ inline void scan_shell(
     const long long query_cell_x,
     const long long query_cell_y,
@@ -384,6 +428,8 @@ __device__ inline void scan_shell(
     const long long* cell_xs,
     const long long* cell_ys,
     const long long* cell_zs,
+    const int* cell_hash_values,
+    const int cell_hash_mask,
     const int* cell_starts,
     const int* cell_ends,
     const int num_cells,
@@ -418,6 +464,8 @@ __device__ inline void scan_shell(
                     cell_xs,
                     cell_ys,
                     cell_zs,
+                    cell_hash_values,
+                    cell_hash_mask,
                     num_cells,
                     query_cell_x + dx,
                     query_cell_y + dy,
@@ -474,6 +522,8 @@ __global__ void approx_knn_equalize_kernel(
     const long long* __restrict__ cell_zs,
     const int* __restrict__ cell_starts,
     const int* __restrict__ cell_ends,
+    const int* __restrict__ cell_hash_values,
+    const int cell_hash_mask,
     const int num_cells,
     const int n,
     const int k,
@@ -524,6 +574,8 @@ __global__ void approx_knn_equalize_kernel(
         cell_xs,
         cell_ys,
         cell_zs,
+        cell_hash_values,
+        cell_hash_mask,
         cell_starts,
         cell_ends,
         num_cells,
@@ -568,6 +620,8 @@ __global__ void approx_knn_equalize_kernel(
             cell_xs,
             cell_ys,
             cell_zs,
+            cell_hash_values,
+            cell_hash_mask,
             cell_starts,
             cell_ends,
             num_cells,
@@ -944,6 +998,8 @@ SpatialIndex build_spatial_index(const InputData& data, const HostArrays& arrays
         start = end;
     }
 
+    build_cell_hash_table(index);
+
     return index;
 }
 
@@ -965,6 +1021,7 @@ ApproxResult compute_approx_knn_gpu(
     long long* d_cell_zs = nullptr;
     int* d_cell_starts = nullptr;
     int* d_cell_ends = nullptr;
+    int* d_cell_hash_values = nullptr;
     int* d_output_intensities = nullptr;
     FlagType* d_fallback_flags = nullptr;
     int* d_fallback_queries = nullptr;
@@ -980,6 +1037,7 @@ ApproxResult compute_approx_knn_gpu(
     const int num_cells = static_cast<int>(index.cell_xs.size());
     const std::size_t cell_coord_bytes = static_cast<std::size_t>(num_cells) * sizeof(long long);
     const std::size_t cell_range_bytes = static_cast<std::size_t>(num_cells) * sizeof(int);
+    const std::size_t hash_bytes = static_cast<std::size_t>(index.cell_hash_values.size()) * sizeof(int);
 
     try {
         CUDA_CHECK(cudaMalloc(&d_query_xs, point_bytes));
@@ -996,6 +1054,9 @@ ApproxResult compute_approx_knn_gpu(
         CUDA_CHECK(cudaMalloc(&d_cell_zs, cell_coord_bytes));
         CUDA_CHECK(cudaMalloc(&d_cell_starts, cell_range_bytes));
         CUDA_CHECK(cudaMalloc(&d_cell_ends, cell_range_bytes));
+        if (!index.cell_hash_values.empty()) {
+            CUDA_CHECK(cudaMalloc(&d_cell_hash_values, hash_bytes));
+        }
         CUDA_CHECK(cudaMalloc(&d_output_intensities, output_bytes));
         CUDA_CHECK(cudaMalloc(&d_fallback_flags, fallback_flag_bytes));
 
@@ -1069,6 +1130,13 @@ ApproxResult compute_approx_knn_gpu(
             index.cell_ends.data(),
             cell_range_bytes,
             cudaMemcpyHostToDevice));
+        if (!index.cell_hash_values.empty()) {
+            CUDA_CHECK(cudaMemcpy(
+                d_cell_hash_values,
+                index.cell_hash_values.data(),
+                hash_bytes,
+                cudaMemcpyHostToDevice));
+        }
 
         const int blocks = (data.n + kThreadsPerBlock - 1) / kThreadsPerBlock;
         approx_knn_equalize_kernel<kThreadsPerBlock><<<blocks, kThreadsPerBlock>>>(
@@ -1086,6 +1154,8 @@ ApproxResult compute_approx_knn_gpu(
             d_cell_zs,
             d_cell_starts,
             d_cell_ends,
+            d_cell_hash_values,
+            index.cell_hash_mask,
             num_cells,
             data.n,
             data.k,
@@ -1163,6 +1233,7 @@ ApproxResult compute_approx_knn_gpu(
         CUDA_CHECK(cudaFree(d_cell_zs));
         CUDA_CHECK(cudaFree(d_cell_starts));
         CUDA_CHECK(cudaFree(d_cell_ends));
+        CUDA_CHECK(cudaFree(d_cell_hash_values));
         CUDA_CHECK(cudaFree(d_output_intensities));
         CUDA_CHECK(cudaFree(d_fallback_flags));
         CUDA_CHECK(cudaFree(d_fallback_queries));
@@ -1183,6 +1254,7 @@ ApproxResult compute_approx_knn_gpu(
         cudaFree(d_cell_zs);
         cudaFree(d_cell_starts);
         cudaFree(d_cell_ends);
+        cudaFree(d_cell_hash_values);
         cudaFree(d_output_intensities);
         cudaFree(d_fallback_flags);
         cudaFree(d_fallback_queries);

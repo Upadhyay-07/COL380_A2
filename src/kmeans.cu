@@ -778,15 +778,15 @@ std::vector<int> compute_kmeans_gpu(const InputData& data, const HostArrays& arr
         CUDA_CHECK(cudaMemset(d_assignments_prev, 0xFF, assignment_bytes));
 
         int* final_assignments = d_assignments_prev;
-        bool converged = false;
 
         const int centroid_blocks = (data.k + kThreadsPerBlock - 1) / kThreadsPerBlock;
+        int host_changed_count = 0;
         for (int iteration = 0; iteration < data.t; ++iteration) {
-            CUDA_CHECK(cudaMemset(d_changed_count, 0, sizeof(int)));
             CUDA_CHECK(cudaMemset(d_sum_xs, 0, centroid_bytes));
             CUDA_CHECK(cudaMemset(d_sum_ys, 0, centroid_bytes));
             CUDA_CHECK(cudaMemset(d_sum_zs, 0, centroid_bytes));
             CUDA_CHECK(cudaMemset(d_counts, 0, centroid_bytes));
+            CUDA_CHECK(cudaMemset(d_changed_count, 0, sizeof(int)));
             assign_and_accumulate_kernel<kThreadsPerBlock><<<blocks, kThreadsPerBlock>>>(
                 d_xs,
                 d_ys,
@@ -804,18 +804,13 @@ std::vector<int> compute_kmeans_gpu(const InputData& data, const HostArrays& arr
                 d_sum_zs,
                 d_counts);
             CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
 
-            int changed_count = 0;
-            CUDA_CHECK(cudaMemcpy(
-                &changed_count,
-                d_changed_count,
-                sizeof(int),
-                cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&host_changed_count, d_changed_count, sizeof(int), cudaMemcpyDeviceToHost));
 
-            final_assignments = d_assignments_next;
-            if (changed_count == 0) {
-                converged = true;
+            std::swap(d_assignments_prev, d_assignments_next);
+            final_assignments = d_assignments_prev;
+
+            if (host_changed_count == 0) {
                 break;
             }
 
@@ -829,14 +824,9 @@ std::vector<int> compute_kmeans_gpu(const InputData& data, const HostArrays& arr
                 d_centroid_ys,
                 d_centroid_zs);
             CUDA_CHECK(cudaGetLastError());
-
-            std::swap(d_assignments_prev, d_assignments_next);
-            final_assignments = d_assignments_prev;
         }
 
-        if (!converged) {
-            final_assignments = d_assignments_prev;
-        }
+        final_assignments = d_assignments_prev;
 
         CUDA_CHECK(cudaMemset(d_cluster_sizes, 0, cluster_size_bytes));
         CUDA_CHECK(cudaMemset(d_cluster_histograms, 0, cluster_histogram_bytes));
