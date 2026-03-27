@@ -1,5 +1,5 @@
 NVCC := nvcc
-ARCH ?= -arch=sm_35
+ARCH ?= -arch=sm_86
 COMMON_NVCCFLAGS := -O3 -Xcompiler -fopenmp $(ARCH)
 EXACT_NVCCFLAGS := $(COMMON_NVCCFLAGS) -std=c++14
 APPROX_NVCCFLAGS := $(COMMON_NVCCFLAGS) -std=c++14
