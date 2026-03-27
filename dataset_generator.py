@@ -1,4 +1,6 @@
+import argparse
 import random
+
 
 def generate_dataset(n, k, T, output_file="input.txt", seed=None):
     if seed is not None:
@@ -31,4 +33,22 @@ def generate_dataset(n, k, T, output_file="input.txt", seed=None):
     print(f"Dataset written to {output_file}")
 
 
-generate_dataset(10, 1, 10)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate a point-cloud dataset for the assignment.")
+    parser.add_argument("--n", "-n", type=int, default=10, help="Number of points.")
+    parser.add_argument("--k", "-k", type=int, default=1, help="Number of neighbors/clusters.")
+    parser.add_argument("--T", "-T", type=int, default=10, help="Number of K-means iterations.")
+    parser.add_argument(
+        "--output", "-o", default="input.txt", help="Path to the generated input file.")
+    parser.add_argument("--seed", type=int, help="Optional RNG seed for reproducible datasets.")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    generate_dataset(args.n, args.k, args.T, output_file=args.output, seed=args.seed)
+
+
+if __name__ == "__main__":
+    main()
