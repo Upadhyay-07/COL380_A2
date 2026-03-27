@@ -66,11 +66,23 @@ constexpr int kApproxOwnCellAcceptDenominator = A2_APPROX_OWN_CELL_ACCEPT_DEN;
 constexpr int kApproxThirdShellTriggerNumerator = A2_APPROX_THIRD_SHELL_TRIGGER_NUM;
 constexpr int kApproxThirdShellTriggerDenominator = A2_APPROX_THIRD_SHELL_TRIGGER_DEN;
 constexpr double kVoxelDistancePercentile = 0.60;
+constexpr uint64_t kCellHashMulX = 0x9e3779b97f4a7c15ULL;
+constexpr uint64_t kCellHashMulY = 0xc2b2ae3d27d4eb4fULL;
+constexpr uint64_t kCellHashMulZ = 0x165667b19e3779f9ULL;
 using IntensityType = std::uint8_t;
 using HistogramCountType = int;
 using FlagType = std::uint8_t;
 using DistanceType = long long;
 constexpr DistanceType kInfiniteDistance = 0x7fffffffffffffffLL;
+
+template <typename T>
+__host__ __device__ inline T load_global(const T* ptr, const int index) {
+#ifdef __CUDA_ARCH__
+    return __ldg(ptr + index);
+#else
+    return ptr[index];
+#endif
+}
 
 struct Point {
     int x;
@@ -133,6 +145,8 @@ struct SpatialIndex {
     std::vector<int> sorted_zs;
     std::vector<IntensityType> sorted_intensities;
     std::vector<int> sorted_original_indices;
+    std::vector<int> cell_hash_values;
+    int cell_hash_mask = 0;
 };
 
 struct ApproxDeviceIndex {
@@ -150,6 +164,8 @@ struct ApproxDeviceIndex {
     long long* cell_zs = nullptr;
     int* cell_starts = nullptr;
     int* cell_ends = nullptr;
+    int* cell_hash_values = nullptr;
+    int cell_hash_mask = 0;
     FlagType* fallback_flags = nullptr;
     int* fallback_queries = nullptr;
     int* fallback_count = nullptr;
@@ -324,9 +340,9 @@ __host__ __device__ inline bool better_candidate(
         candidate_x,
         candidate_y,
         candidate_z,
-        current_xs[current_index],
-        current_ys[current_index],
-        current_zs[current_index]);
+        load_global(current_xs, current_index),
+        load_global(current_ys, current_index),
+        load_global(current_zs, current_index));
     if (coordinate_cmp != 0) {
         return coordinate_cmp < 0;
     }
@@ -733,34 +749,73 @@ __host__ __device__ inline double shell_outside_lower_bound_sq(
     return min_axis_distance * min_axis_distance;
 }
 
+__host__ __device__ inline uint64_t encode_cell_coords(
+    const long long x,
+    const long long y,
+    const long long z) {
+    const uint64_t ux = static_cast<uint64_t>(x);
+    const uint64_t uy = static_cast<uint64_t>(y);
+    const uint64_t uz = static_cast<uint64_t>(z);
+    return (ux * kCellHashMulX) ^ (uy * kCellHashMulY) ^ (uz * kCellHashMulZ);
+}
+
+void build_cell_hash_table(SpatialIndex& index) {
+    const int num_cells = static_cast<int>(index.cell_xs.size());
+    if (num_cells == 0) {
+        index.cell_hash_mask = 0;
+        index.cell_hash_values.clear();
+        return;
+    }
+
+    int table_size = 1;
+    while (table_size < num_cells * 2) {
+        table_size <<= 1;
+    }
+    index.cell_hash_mask = table_size - 1;
+    index.cell_hash_values.assign(table_size, -1);
+
+    for (int cell_id = 0; cell_id < num_cells; ++cell_id) {
+        const uint64_t key = encode_cell_coords(
+            index.cell_xs[cell_id],
+            index.cell_ys[cell_id],
+            index.cell_zs[cell_id]);
+        int slot = static_cast<int>(key & static_cast<uint64_t>(index.cell_hash_mask));
+        while (index.cell_hash_values[slot] != -1) {
+            slot = (slot + 1) & index.cell_hash_mask;
+        }
+        index.cell_hash_values[slot] = cell_id;
+    }
+}
+
 __device__ inline int find_cell_range(
     const long long* cell_xs,
     const long long* cell_ys,
     const long long* cell_zs,
+    const int* cell_hash_values,
+    const int cell_hash_mask,
     const int num_cells,
     const long long query_x,
     const long long query_y,
     const long long query_z) {
-    int low = 0;
-    int high = num_cells - 1;
-    while (low <= high) {
-        const int mid = low + (high - low) / 2;
-        const int cmp = compare_cell_triplets(
-            cell_xs[mid],
-            cell_ys[mid],
-            cell_zs[mid],
-            query_x,
-            query_y,
-            query_z);
-        if (cmp < 0) {
-            low = mid + 1;
-        } else if (cmp > 0) {
-            high = mid - 1;
-        } else {
-            return mid;
-        }
+    if (cell_hash_mask == 0 || cell_hash_values == nullptr) {
+        return -1;
     }
-    return -1;
+
+    uint64_t key = encode_cell_coords(query_x, query_y, query_z);
+    int slot = static_cast<int>(key & static_cast<uint64_t>(cell_hash_mask));
+    while (true) {
+        const int cell_id = cell_hash_values[slot];
+        if (cell_id < 0) {
+            return -1;
+        }
+        if (cell_id < num_cells &&
+            cell_xs[cell_id] == query_x &&
+            cell_ys[cell_id] == query_y &&
+            cell_zs[cell_id] == query_z) {
+            return cell_id;
+        }
+        slot = (slot + 1) & cell_hash_mask;
+    }
 }
 
 __device__ inline void scan_shell(
@@ -781,6 +836,8 @@ __device__ inline void scan_shell(
     const long long* cell_xs,
     const long long* cell_ys,
     const long long* cell_zs,
+    const int* cell_hash_values,
+    const int cell_hash_mask,
     const int* cell_starts,
     const int* cell_ends,
     const int num_cells,
@@ -815,6 +872,8 @@ __device__ inline void scan_shell(
                     cell_xs,
                     cell_ys,
                     cell_zs,
+                    cell_hash_values,
+                    cell_hash_mask,
                     num_cells,
                     query_cell_x + dx,
                     query_cell_y + dy,
@@ -824,25 +883,28 @@ __device__ inline void scan_shell(
                 }
 
                 for (int position = cell_starts[cell_id]; position < cell_ends[cell_id]; ++position) {
-                    const int candidate_index = sorted_original_indices[position];
+                    const int candidate_index = load_global(sorted_original_indices, position);
                     if (candidate_index == query_index) {
                         continue;
                     }
                     ++(*candidate_count);
+                    const int candidate_x = load_global(sorted_xs, position);
+                    const int candidate_y = load_global(sorted_ys, position);
+                    const int candidate_z = load_global(sorted_zs, position);
                     const DistanceType distance = squared_distance(
                         query_x,
                         query_y,
                         query_z,
-                        sorted_xs[position],
-                        sorted_ys[position],
-                        sorted_zs[position]);
+                        candidate_x,
+                        candidate_y,
+                        candidate_z);
                     insert_candidate(
                         distance,
-                        sorted_xs[position],
-                        sorted_ys[position],
-                        sorted_zs[position],
+                        candidate_x,
+                        candidate_y,
+                        candidate_z,
                         candidate_index,
-                        sorted_intensities[position],
+                        load_global(sorted_intensities, position),
                         k,
                         original_xs,
                         original_ys,
@@ -870,6 +932,8 @@ __global__ void approx_knn_equalize_kernel(
     const long long* __restrict__ cell_xs,
     const long long* __restrict__ cell_ys,
     const long long* __restrict__ cell_zs,
+    const int* __restrict__ cell_hash_values,
+    const int cell_hash_mask,
     const int* __restrict__ cell_starts,
     const int* __restrict__ cell_ends,
     const int num_cells,
@@ -892,10 +956,10 @@ __global__ void approx_knn_equalize_kernel(
         best_intensities[neighbor] = 0;
     }
 
-    const int query_x = query_xs[point_index];
-    const int query_y = query_ys[point_index];
-    const int query_z = query_zs[point_index];
-    const IntensityType center_intensity = query_intensities[point_index];
+    const int query_x = load_global(query_xs, point_index);
+    const int query_y = load_global(query_ys, point_index);
+    const int query_z = load_global(query_zs, point_index);
+    const IntensityType center_intensity = load_global(query_intensities, point_index);
     const long long query_cell_x = coordinate_to_cell(query_x, inv_cell_size);
     const long long query_cell_y = coordinate_to_cell(query_y, inv_cell_size);
     const long long query_cell_z = coordinate_to_cell(query_z, inv_cell_size);
@@ -928,6 +992,8 @@ __global__ void approx_knn_equalize_kernel(
         cell_xs,
         cell_ys,
         cell_zs,
+        cell_hash_values,
+        cell_hash_mask,
         cell_starts,
         cell_ends,
         num_cells,
@@ -959,6 +1025,8 @@ __global__ void approx_knn_equalize_kernel(
             cell_xs,
             cell_ys,
             cell_zs,
+            cell_hash_values,
+            cell_hash_mask,
             cell_starts,
             cell_ends,
             num_cells,
@@ -991,6 +1059,8 @@ __global__ void approx_knn_equalize_kernel(
             cell_xs,
             cell_ys,
             cell_zs,
+            cell_hash_values,
+            cell_hash_mask,
             cell_starts,
             cell_ends,
             num_cells,
@@ -1069,11 +1139,11 @@ __global__ void exact_fallback_kernel(
     IntensityType center_intensity = 0;
 
     if (active) {
-        point_index = fallback_queries[fallback_id];
-        query_x = xs[point_index];
-        query_y = ys[point_index];
-        query_z = zs[point_index];
-        center_intensity = intensities[point_index];
+        point_index = load_global(fallback_queries, fallback_id);
+        query_x = load_global(xs, point_index);
+        query_y = load_global(ys, point_index);
+        query_z = load_global(zs, point_index);
+        center_intensity = load_global(intensities, point_index);
         for (int neighbor = 0; neighbor < k; ++neighbor) {
             best_distances[neighbor] = kInfiniteDistance;
             best_indices[neighbor] = -1;
@@ -1084,10 +1154,10 @@ __global__ void exact_fallback_kernel(
     for (int tile_start = 0; tile_start < n; tile_start += BlockSize) {
         const int load_index = tile_start + threadIdx.x;
         if (load_index < n) {
-            tile_xs[threadIdx.x] = xs[load_index];
-            tile_ys[threadIdx.x] = ys[load_index];
-            tile_zs[threadIdx.x] = zs[load_index];
-            tile_intensities[threadIdx.x] = intensities[load_index];
+            tile_xs[threadIdx.x] = load_global(xs, load_index);
+            tile_ys[threadIdx.x] = load_global(ys, load_index);
+            tile_zs[threadIdx.x] = load_global(zs, load_index);
+            tile_intensities[threadIdx.x] = load_global(intensities, load_index);
         }
         __syncthreads();
 
@@ -1279,6 +1349,8 @@ SpatialIndex build_spatial_index(const InputData& data, const HostArrays& arrays
         start = end;
     }
 
+    build_cell_hash_table(index);
+
     return index;
 }
 
@@ -1288,6 +1360,7 @@ ApproxDeviceIndex upload_spatial_index(const InputData& data, const SpatialIndex
     device_index.num_cells = static_cast<int>(index.cell_xs.size());
     device_index.cell_size = index.cell_size;
     device_index.inv_cell_size = index.inv_cell_size;
+    device_index.cell_hash_mask = index.cell_hash_mask;
 
     const std::size_t point_bytes = static_cast<std::size_t>(data.n) * sizeof(int);
     const std::size_t intensity_bytes = static_cast<std::size_t>(data.n) * sizeof(IntensityType);
@@ -1296,6 +1369,7 @@ ApproxDeviceIndex upload_spatial_index(const InputData& data, const SpatialIndex
     const std::size_t query_bytes = static_cast<std::size_t>(data.n) * sizeof(int);
     const std::size_t cell_coord_bytes = static_cast<std::size_t>(device_index.num_cells) * sizeof(long long);
     const std::size_t cell_range_bytes = static_cast<std::size_t>(device_index.num_cells) * sizeof(int);
+    const std::size_t hash_bytes = static_cast<std::size_t>(index.cell_hash_values.size()) * sizeof(int);
 
     const double wall_start = omp_get_wtime();
     try {
@@ -1312,6 +1386,9 @@ ApproxDeviceIndex upload_spatial_index(const InputData& data, const SpatialIndex
         CUDA_CHECK(cudaMalloc(&device_index.fallback_flags, flag_bytes));
         CUDA_CHECK(cudaMalloc(&device_index.fallback_queries, query_bytes));
         CUDA_CHECK(cudaMalloc(&device_index.fallback_count, sizeof(int)));
+        if (!index.cell_hash_values.empty()) {
+            CUDA_CHECK(cudaMalloc(&device_index.cell_hash_values, hash_bytes));
+        }
 
         CUDA_CHECK(cudaMemcpy(device_index.sorted_xs, index.sorted_xs.data(), point_bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(device_index.sorted_ys, index.sorted_ys.data(), point_bytes, cudaMemcpyHostToDevice));
@@ -1323,6 +1400,10 @@ ApproxDeviceIndex upload_spatial_index(const InputData& data, const SpatialIndex
         CUDA_CHECK(cudaMemcpy(device_index.cell_zs, index.cell_zs.data(), cell_coord_bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(device_index.cell_starts, index.cell_starts.data(), cell_range_bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(device_index.cell_ends, index.cell_ends.data(), cell_range_bytes, cudaMemcpyHostToDevice));
+        if (!index.cell_hash_values.empty()) {
+            CUDA_CHECK(cudaMemcpy(device_index.cell_hash_values, index.cell_hash_values.data(), hash_bytes, cudaMemcpyHostToDevice));
+            device_index.cell_hash_mask = index.cell_hash_mask;
+        }
     } catch (...) {
         cudaFree(device_index.sorted_xs);
         cudaFree(device_index.sorted_ys);
@@ -1337,6 +1418,7 @@ ApproxDeviceIndex upload_spatial_index(const InputData& data, const SpatialIndex
         cudaFree(device_index.fallback_flags);
         cudaFree(device_index.fallback_queries);
         cudaFree(device_index.fallback_count);
+        cudaFree(device_index.cell_hash_values);
         throw;
     }
     if (upload_ms != nullptr) {
@@ -1359,6 +1441,7 @@ void free_spatial_index(ApproxDeviceIndex& device_index) {
     cudaFree(device_index.fallback_flags);
     cudaFree(device_index.fallback_queries);
     cudaFree(device_index.fallback_count);
+    cudaFree(device_index.cell_hash_values);
     device_index = ApproxDeviceIndex{};
 }
 
@@ -1431,6 +1514,8 @@ __global__ void exact_grid_knn_equalize_kernel(
     const long long* __restrict__ cell_xs,
     const long long* __restrict__ cell_ys,
     const long long* __restrict__ cell_zs,
+    const int* __restrict__ cell_hash_values,
+    const int cell_hash_mask,
     const int* __restrict__ cell_starts,
     const int* __restrict__ cell_ends,
     const int num_cells,
@@ -1459,10 +1544,10 @@ __global__ void exact_grid_knn_equalize_kernel(
         best_intensities[neighbor] = 0;
     }
 
-    const int query_x = query_xs[point_index];
-    const int query_y = query_ys[point_index];
-    const int query_z = query_zs[point_index];
-    const IntensityType center_intensity = query_intensities[point_index];
+    const int query_x = load_global(query_xs, point_index);
+    const int query_y = load_global(query_ys, point_index);
+    const int query_z = load_global(query_zs, point_index);
+    const IntensityType center_intensity = load_global(query_intensities, point_index);
     const long long query_cell_x = coordinate_to_cell(query_x, inv_cell_size);
     const long long query_cell_y = coordinate_to_cell(query_y, inv_cell_size);
     const long long query_cell_z = coordinate_to_cell(query_z, inv_cell_size);
@@ -1486,6 +1571,8 @@ __global__ void exact_grid_knn_equalize_kernel(
         cell_xs,
         cell_ys,
         cell_zs,
+        cell_hash_values,
+        cell_hash_mask,
         cell_starts,
         cell_ends,
         num_cells,
@@ -1554,6 +1641,8 @@ __global__ void exact_grid_knn_equalize_kernel(
             cell_xs,
             cell_ys,
             cell_zs,
+            cell_hash_values,
+            cell_hash_mask,
             cell_starts,
             cell_ends,
             num_cells,
@@ -1651,6 +1740,8 @@ std::vector<int> compute_exact_knn_gpu(
             device_index.cell_xs,
             device_index.cell_ys,
             device_index.cell_zs,
+            device_index.cell_hash_values,
+            device_index.cell_hash_mask,
             device_index.cell_starts,
             device_index.cell_ends,
             device_index.num_cells,
@@ -1750,6 +1841,8 @@ std::vector<int> compute_approx_knn_gpu(
             device_index.cell_xs,
             device_index.cell_ys,
             device_index.cell_zs,
+            device_index.cell_hash_values,
+            device_index.cell_hash_mask,
             device_index.cell_starts,
             device_index.cell_ends,
             device_index.num_cells,
@@ -2008,9 +2101,9 @@ __global__ void assign_clusters_kernel(
 
     const int point_index = blockIdx.x * BlockSize + threadIdx.x;
     if (point_index < n) {
-        const int x = xs[point_index];
-        const int y = ys[point_index];
-        const int z = zs[point_index];
+        const int x = load_global(xs, point_index);
+        const int y = load_global(ys, point_index);
+        const int z = load_global(zs, point_index);
         DistanceType best_distance = 0;
         int best_cluster = -1;
 
@@ -2040,7 +2133,8 @@ __global__ void assign_clusters_kernel(
         }
 
         next_assignments[point_index] = best_cluster;
-        if (previous_assignments[point_index] != best_cluster) {
+        const int previous_assignment = load_global(previous_assignments, point_index);
+        if (previous_assignment != best_cluster) {
             atomicAdd(&block_changed, 1);
         }
     }
@@ -2140,9 +2234,9 @@ __global__ void assign_and_accumulate_kernel(
     const int point_index = blockIdx.x * BlockSize + threadIdx.x;
     int best_cluster = -1;
     if (point_index < n) {
-        const int x = xs[point_index];
-        const int y = ys[point_index];
-        const int z = zs[point_index];
+        const int x = load_global(xs, point_index);
+        const int y = load_global(ys, point_index);
+        const int z = load_global(zs, point_index);
         DistanceType best_distance = 0;
 
         for (int cluster = 0; cluster < k; ++cluster) {
@@ -2169,7 +2263,8 @@ __global__ void assign_and_accumulate_kernel(
         }
 
         next_assignments[point_index] = best_cluster;
-        if (previous_assignments[point_index] != best_cluster) {
+        const int previous_assignment = load_global(previous_assignments, point_index);
+        if (previous_assignment != best_cluster) {
             atomicAdd(&block_changed, 1);
         }
         atomicAdd(&block_sum_xs[best_cluster], x);
@@ -2224,8 +2319,8 @@ __global__ void build_cluster_histograms_kernel(
     if (point_index >= n) {
         return;
     }
-    const int cluster = assignments[point_index];
-    const int intensity = static_cast<int>(intensities[point_index]);
+    const int cluster = load_global(assignments, point_index);
+    const int intensity = static_cast<int>(load_global(intensities, point_index));
     atomicAdd(&cluster_sizes[cluster], 1);
     atomicAdd(&cluster_histograms[cluster * kIntensityLevels + intensity], 1);
 }
@@ -2242,11 +2337,11 @@ __global__ void remap_clusters_kernel(
     if (point_index >= n) {
         return;
     }
-    const int cluster = assignments[point_index];
+    const int cluster = load_global(assignments, point_index);
     const HistogramCountType* histogram = cluster_histograms + cluster * kIntensityLevels;
     output_intensities[point_index] = remap_intensity(
         histogram,
-        static_cast<int>(intensities[point_index]),
+        static_cast<int>(load_global(intensities, point_index)),
         cluster_sizes[cluster]);
 }
 
