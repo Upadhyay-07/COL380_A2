@@ -1,0 +1,77 @@
+# Assignment 2 Clarifications
+
+Date noted: 2026-03-20
+
+## Clarification 1
+
+Coordinates will be integer-valued.
+
+## Clarification 2
+
+The following commands will be run on the submission:
+
+unzip a2
+cd a2
+make
+./a2 input.txt knn
+./a2 input.txt approx_knn
+./a2 input.txt kmeans
+Expected behavior:
+
+- make should produce an executable named a2.
+- ./a2 input.txt knn should produce knn.txt in the same directory.
+- ./a2 input.txt approx_knn should produce approx_knn.txt in the same directory.
+- ./a2 input.txt kmeans should produce kmeans.txt in the same directory.
+
+## Clarification 3
+
+In case of ties in distance, choose the lexicographically smaller point.
+
+Practical interpretation for points p = (x, y, z):
+
+- Compare x first.
+- If x is equal, compare y.
+- If y is equal, compare z.
+
+## Clarification 4
+
+For KNN:
+
+- Choose the top k points nearest to the center point.
+- These k points do not include the center point itself.
+- The local histogram is computed over the center point and its k nearest neighbors.
+- Therefore, the KNN local histogram is built over k + 1 points.
+
+For approximate KNN:
+
+- Use the same interpretation as exact KNN.
+- The approximate search returns k nearby points excluding the center point.
+- The local histogram is computed over the center point and those k approximate neighbors.
+
+For K-means clustering:
+
+- Each point belongs to its cluster.
+- The local histogram is computed over the full cluster, including the center point itself.
+
+## Clarification 5
+
+For K-means centroid updates:
+
+- Use integer division for computing centroid coordinates.
+- Treat centroid coordinates as integers throughout the implementation.
+- In case of assignment ties, assign the point to the cluster with the lexicographically smaller centroid.
+- Practical implementation form:
+  - int centroid = sum_of_coordinates / count
+
+For intensity remapping:
+
+- Do not use integer division for the normalization ratio.
+- Cast the numerator and denominator to double or float, multiply by 255.0, and then take floor.
+- Practical implementation form:
+  - double temp = (((double)(cdf_at_intensity - cdf_min)) / (double)(m - cdf_min)) * 255.0;
+  - new_intensity = (int)floor(temp);
+
+## Working Note
+
+Packaging and final a2 submission structure can be handled later.
+For now, implementation should be designed to satisfy the command interface above.

@@ -1,0 +1,150 @@
+Assignment 2
+PARALLEL PROGRAMMING USING CUDA AND OPENMP
+Deadline - March 24, 2026
+
+Introduction
+Histogram equalization is used to improve the contrast of 3D color data by
+manipulating their intensity distributions. In this assignment, you will be given
+a 3D point cloud.
+Each point cloud consists of a set of N points:
+P = {p1 , p2 , . . . , pN }
+Each point pi has:
+• 3D spatial coordinates (xi , yi , zi )
+• An intensity value Ii ∈ {0, 1, . . . , 255}
+Unlike regular images, point clouds are not arranged on a 2D grid. Instead,
+neighborhood relationships are defined by spatial proximity in 3D space.
+Your task is to implement local histogram equalization on graphstructured data using CUDA using three different approaches and then compare their efficiency in your reports. You are encouraged to use openmp for host
+side optimizations.
+
+Graph-Based Local Histogram Equalization
+1. Defining points for local histogram
+For each cloud, you will perform histogram equalization using three different
+local histograms. Use Euclidean distance formula.
+(a) Using KNN
+For each point pi , define its k-nearest neighbors as:
+Nk (i) = {j | pj is among the k closest points to pi }
+For each point pi , compute a local histogram over this neighborhood:
+1
+
+Hi [v] = |{j ∈ Nk (i) : Ij = v}|
+where:
+v ∈ {0, 1, . . . , 255}
+(b) Using Approximate KNN
+For each point pi , define its k-nearest neighbors using any of the approximate
+KNN algorithms to create a set Nk (i). You need to find an algorithm which
+can be parallelized to get significant speedup and gives a close enough output
+to the ground truth.
+You may choose to experiment with different algorithms. Write in your
+report in detail regarding the trade offs between time and accuracy with KNN.
+For each point pi , compute a local histogram over this neighborhood:
+Hi [v] = |{j ∈ Nk (i) : Ij = v}|
+where:
+v ∈ {0, 1, . . . , 255}
+(c) Using K-means clustering
+Define k clusters using parallelized version of K-means clustering. Each point
+pi gets assigned to a cluster, say Nk (i).
+For each point pi , compute a local histogram over this cluster:
+Hi [v] = |{j ∈ Nk (i) : Ij = v}|
+where:
+v ∈ {0, 1, . . . , 255}
+Initialise the centroids using first k points. Stop if the algorithm converges
+(no change in assignments) or after T iterations.
+
+2. Local CDF Computation
+For each point pi , compute its local cumulative distribution function:
+Ci [v] =
+
+v
+X
+
+Hi [u]
+
+u=0
+
+Let:
+Ci,min = min{Ci [v] | Ci [v] > 0}
+
+2
+
+3. Local Intensity Remapping
+The new intensity of point pi is:
+
+
+Ci [Ii ] − Ci,min
+′
+Ii =
+× (L − 1)
+m − Ci,min
+where L = 256.
+Note that in case of KNN algorithms, m = k. Whereas, for k-means clustering, m = |Nk (i)|.
+If m = Ci,min , take Ii′ = Ii . Steps 2 and 3 remain same for each approach
+of computing local histogram. However you may choose to implement them
+differently to optimise them for a particular approach.
+
+Input Format
+The input will be provided as a single text file with the following format:
+• Line 1: Integer n — number of points.
+• Line 2: Integer k — number of neighbors in case of KNN (and number of
+clusters in case of K-means).
+• Line 3: Integer T — maximum number of iterations for K-means.
+• Next n lines: Each line contains four values:
+x
+
+y
+
+z
+
+I
+
+where (x, y, z) ∈ R3 and I ∈ {0, . . . , 255}.
+
+Output Format
+Your program must generate three output files:
+• knn.txt
+• approx knn.txt
+• kmeans.txt
+Each file must contain n lines in the format:
+x
+
+y
+
+z
+
+I′
+
+Points must appear in the same order as input.
+
+3
+
+Report
+• Include implementation details and design decisions for each part.
+• Perform a runtime analysis over the three different approaches to create
+histogram.
+
+Evaluation
+The marks breakdown is as follows • KNN algorithm – 25 points
+• Approximate KNN algorithm – 30 points
+• K-Means clustering – 30 points
+• Report – 10 points
+For KNN algorithm and K-Means clustering,
+• Correctness – 25% credits
+(Performance will be graded only if the program is CORRECT)
+• Performance – 75% credits
+We will run your program against our sequential version to evaluate speedup.
+For approximate KNN,
+• Correctness – 30% credits
+(Performance will be graded only if the program is CORRECT)
+Correctness will be evaluated by comparing output intensities produced by
+exact KNN implementation using Mean Absolute Error (MAE). Deviation below a certain threshold will be considered correct. Threshold will be
+determined based on the submissions.
+• Performance – 70% credits
+We will run your program against your KNN version to evaluate speedup.
+
+Notes
+• All computations must be implemented using CUDA AND OPENMP.
+• Use of Thrust, cuML, FAISS, or other high-level GPU libraries is not
+allowed.
+
+4
+
+
