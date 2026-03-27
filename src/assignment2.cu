@@ -2095,6 +2095,103 @@ __global__ void accumulate_cluster_sums_kernel(
     }
 }
 
+// Fused kernel: assignment + accumulation in one pass over points,
+// saving one full global-memory read of xs/ys/zs per K-means iteration.
+template <int BlockSize>
+__global__ void assign_and_accumulate_kernel(
+    const int* __restrict__ xs,
+    const int* __restrict__ ys,
+    const int* __restrict__ zs,
+    const int* __restrict__ centroid_xs,
+    const int* __restrict__ centroid_ys,
+    const int* __restrict__ centroid_zs,
+    const int n,
+    const int k,
+    const int* __restrict__ previous_assignments,
+    int* __restrict__ next_assignments,
+    int* __restrict__ changed_count,
+    int* __restrict__ sum_xs,
+    int* __restrict__ sum_ys,
+    int* __restrict__ sum_zs,
+    int* __restrict__ counts) {
+    __shared__ int block_changed;
+    __shared__ int shared_centroid_xs[kMaxK];
+    __shared__ int shared_centroid_ys[kMaxK];
+    __shared__ int shared_centroid_zs[kMaxK];
+    __shared__ int block_sum_xs[kMaxK];
+    __shared__ int block_sum_ys[kMaxK];
+    __shared__ int block_sum_zs[kMaxK];
+    __shared__ int block_counts[kMaxK];
+
+    if (threadIdx.x == 0) {
+        block_changed = 0;
+    }
+    for (int cluster = threadIdx.x; cluster < k; cluster += BlockSize) {
+        shared_centroid_xs[cluster] = centroid_xs[cluster];
+        shared_centroid_ys[cluster] = centroid_ys[cluster];
+        shared_centroid_zs[cluster] = centroid_zs[cluster];
+        block_sum_xs[cluster] = 0;
+        block_sum_ys[cluster] = 0;
+        block_sum_zs[cluster] = 0;
+        block_counts[cluster] = 0;
+    }
+    __syncthreads();
+
+    const int point_index = blockIdx.x * BlockSize + threadIdx.x;
+    int best_cluster = -1;
+    if (point_index < n) {
+        const int x = xs[point_index];
+        const int y = ys[point_index];
+        const int z = zs[point_index];
+        DistanceType best_distance = 0;
+
+        for (int cluster = 0; cluster < k; ++cluster) {
+            const DistanceType distance = squared_distance(
+                x, y, z,
+                shared_centroid_xs[cluster],
+                shared_centroid_ys[cluster],
+                shared_centroid_zs[cluster]);
+            if (best_cluster < 0 ||
+                better_candidate(
+                    distance,
+                    shared_centroid_xs[cluster],
+                    shared_centroid_ys[cluster],
+                    shared_centroid_zs[cluster],
+                    cluster,
+                    best_distance,
+                    best_cluster,
+                    shared_centroid_xs,
+                    shared_centroid_ys,
+                    shared_centroid_zs)) {
+                best_distance = distance;
+                best_cluster = cluster;
+            }
+        }
+
+        next_assignments[point_index] = best_cluster;
+        if (previous_assignments[point_index] != best_cluster) {
+            atomicAdd(&block_changed, 1);
+        }
+        atomicAdd(&block_sum_xs[best_cluster], x);
+        atomicAdd(&block_sum_ys[best_cluster], y);
+        atomicAdd(&block_sum_zs[best_cluster], z);
+        atomicAdd(&block_counts[best_cluster], 1);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0 && block_changed > 0) {
+        atomicAdd(changed_count, block_changed);
+    }
+    for (int cluster = threadIdx.x; cluster < k; cluster += BlockSize) {
+        if (block_counts[cluster] > 0) {
+            atomicAdd(&sum_xs[cluster], block_sum_xs[cluster]);
+            atomicAdd(&sum_ys[cluster], block_sum_ys[cluster]);
+            atomicAdd(&sum_zs[cluster], block_sum_zs[cluster]);
+            atomicAdd(&counts[cluster], block_counts[cluster]);
+        }
+    }
+}
+
 __global__ void update_centroids_kernel(
     const int k,
     const int* __restrict__ sum_xs,
@@ -2123,48 +2220,14 @@ __global__ void build_cluster_histograms_kernel(
     const int n,
     int* __restrict__ cluster_sizes,
     HistogramCountType* __restrict__ cluster_histograms) {
-    __shared__ int block_cluster_sizes[kMaxK];
-    __shared__ int hash_keys[kKMeansHistogramHashSize];
-    __shared__ HistogramCountType hash_counts[kKMeansHistogramHashSize];
-
-    for (int cluster = threadIdx.x; cluster < kMaxK; cluster += BlockSize) {
-        block_cluster_sizes[cluster] = 0;
-    }
-    for (int slot = threadIdx.x; slot < kKMeansHistogramHashSize; slot += BlockSize) {
-        hash_keys[slot] = 0;
-        hash_counts[slot] = 0;
-    }
-    __syncthreads();
-
     const int point_index = blockIdx.x * BlockSize + threadIdx.x;
-    if (point_index < n) {
-        const int cluster = assignments[point_index];
-        const int key = cluster * kIntensityLevels + static_cast<int>(intensities[point_index]) + 1;
-        atomicAdd(&block_cluster_sizes[cluster], 1);
-
-        unsigned int slot = (static_cast<unsigned int>(key) * 2654435761u) & (kKMeansHistogramHashSize - 1);
-        while (true) {
-            const int previous = atomicCAS(&hash_keys[slot], 0, key);
-            if (previous == 0 || previous == key) {
-                atomicAdd(&hash_counts[slot], 1);
-                break;
-            }
-            slot = (slot + 1) & (kKMeansHistogramHashSize - 1);
-        }
+    if (point_index >= n) {
+        return;
     }
-    __syncthreads();
-
-    for (int cluster = threadIdx.x; cluster < kMaxK; cluster += BlockSize) {
-        if (block_cluster_sizes[cluster] > 0) {
-            atomicAdd(&cluster_sizes[cluster], block_cluster_sizes[cluster]);
-        }
-    }
-    for (int slot = threadIdx.x; slot < kKMeansHistogramHashSize; slot += BlockSize) {
-        const int key = hash_keys[slot];
-        if (key != 0) {
-            atomicAdd(&cluster_histograms[key - 1], hash_counts[slot]);
-        }
-    }
+    const int cluster = assignments[point_index];
+    const int intensity = static_cast<int>(intensities[point_index]);
+    atomicAdd(&cluster_sizes[cluster], 1);
+    atomicAdd(&cluster_histograms[cluster * kIntensityLevels + intensity], 1);
 }
 
 template <int BlockSize>
@@ -2277,8 +2340,17 @@ std::vector<int> compute_kmeans_gpu(
 
     int* final_assignments = workspace.assignments_prev;
     for (int iteration = 0; iteration < data.t; ++iteration) {
+        // Reset changed_count and cluster-sum accumulators before the fused kernel.
         CUDA_CHECK(cudaMemset(workspace.changed_count, 0, sizeof(int)));
-        assign_clusters_kernel<kKMeansThreadsPerBlock><<<point_blocks, kKMeansThreadsPerBlock>>>(
+        CUDA_CHECK(cudaMemset(workspace.sum_xs, 0, centroid_bytes));
+        CUDA_CHECK(cudaMemset(workspace.sum_ys, 0, centroid_bytes));
+        CUDA_CHECK(cudaMemset(workspace.sum_zs, 0, centroid_bytes));
+        CUDA_CHECK(cudaMemset(workspace.counts, 0, centroid_bytes));
+        // Single fused kernel: assign each point to its nearest centroid AND
+        // accumulate the per-cluster coordinate sums in the same pass.
+        // This replaces the old assign_clusters_kernel + accumulate_cluster_sums_kernel
+        // pair, halving global memory traffic (xs/ys/zs read once, not twice).
+        assign_and_accumulate_kernel<kKMeansThreadsPerBlock><<<point_blocks, kKMeansThreadsPerBlock>>>(
             device_input.xs,
             device_input.ys,
             device_input.zs,
@@ -2289,7 +2361,11 @@ std::vector<int> compute_kmeans_gpu(
             data.k,
             workspace.assignments_prev,
             workspace.assignments_next,
-            workspace.changed_count);
+            workspace.changed_count,
+            workspace.sum_xs,
+            workspace.sum_ys,
+            workspace.sum_zs,
+            workspace.counts);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -2300,23 +2376,10 @@ std::vector<int> compute_kmeans_gpu(
             break;
         }
 
-        CUDA_CHECK(cudaMemset(workspace.sum_xs, 0, centroid_bytes));
-        CUDA_CHECK(cudaMemset(workspace.sum_ys, 0, centroid_bytes));
-        CUDA_CHECK(cudaMemset(workspace.sum_zs, 0, centroid_bytes));
-        CUDA_CHECK(cudaMemset(workspace.counts, 0, centroid_bytes));
-        accumulate_cluster_sums_kernel<kKMeansThreadsPerBlock><<<point_blocks, kKMeansThreadsPerBlock>>>(
-            device_input.xs,
-            device_input.ys,
-            device_input.zs,
-            workspace.assignments_next,
-            data.n,
-            data.k,
-            workspace.sum_xs,
-            workspace.sum_ys,
-            workspace.sum_zs,
-            workspace.counts);
-        CUDA_CHECK(cudaGetLastError());
-
+        // Recompute centroids from the accumulated sums.
+        // No explicit sync needed here: update_centroids_kernel is enqueued in the
+        // same default stream as the next iteration's memsets, so CUDA ordering
+        // guarantees it finishes before the next fused kernel reads the centroids.
         update_centroids_kernel<<<centroid_blocks, kKMeansThreadsPerBlock>>>(
             data.k,
             workspace.sum_xs,
@@ -2327,7 +2390,6 @@ std::vector<int> compute_kmeans_gpu(
             workspace.centroid_ys,
             workspace.centroid_zs);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
 
         std::swap(workspace.assignments_prev, workspace.assignments_next);
         final_assignments = workspace.assignments_prev;
